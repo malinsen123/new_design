@@ -5,7 +5,6 @@
 #include "def_helper.h"
 
 
-#define VALUE_SIZE 4
 
 
 

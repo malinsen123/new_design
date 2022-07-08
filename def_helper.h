@@ -11,7 +11,7 @@
 #define HOT_BLOCK_SIZE 512
 #define SEG_PER_BLK BLOCK_SIZE/(8*8)
 
-#define VALUE_SIZE 8
+#define VALUE_SIZE 48
 #define ITEM_PER_OP 4
 
 
@@ -31,7 +31,7 @@
 
 //Define the page and blk size
 
-#define PAGE_COUNT 10000
+#define PAGE_COUNT 200000
 #define BLK_PER_PG 14
 #define BLOCK_COUNT (PAGE_COUNT * BLK_PER_PG)
 
@@ -116,7 +116,7 @@ typedef struct op_buffer_{
 	op_item items[ITEM_PER_OP];
 }op_buffer;
 
-typedef struct /*__attribute__((packed))*/ cg_buffer_{
+typedef struct __attribute__((packed)) cg_buffer_{
 	unsigned char status[SEG_PER_BLK*2];
 	uint_least8_t blk_id;
 	struct cg_buffer_* next;
@@ -124,16 +124,27 @@ typedef struct /*__attribute__((packed))*/ cg_buffer_{
 }cg_buffer;
 
 
+typedef struct of_item_{
+	uint_least8_t blk_id;
+	uint_least64_t key;
+	char value[VALUE_SIZE];
+	struct of_item_* next;
+}of_item;
+
+
+
 
 struct page {
 	char * compr_data;
 	op_buffer * op_buffer_head;
+	of_item * of_buffer_head;
 	cg_buffer * cg_buffer_head;
 
 	uint_least8_t op_counts;
 	uint_least8_t cg_counts;
+	uint_least8_t of_counts;
 	uint_least16_t compr_size;
-	//uint_least16_t t_size;
+	uint_least16_t t_size;
     uint_least8_t hot_items[HOT_ITEM_NUM*4];
     uint_least8_t hot_front;
     uint_least8_t hot_tail;
@@ -160,7 +171,8 @@ typedef struct stat_
 
 	uint64_t pg_num;
 	uint64_t worker_num;
-	uint64_t cur_storesize;
+	//uint64_t cur_storesize;
+
 
 	uint64_t item_num;
 	uint64_t item_in_op;
@@ -177,6 +189,10 @@ typedef struct stat_
 	uint64_t delete_hit;
 	uint64_t delete_miss;
 
+
+	//uint64_t tol_compr_size;
+	//uint64_t tol_op_size;
+	//uint64_t tol_cg_size;
 
 
 }stat;

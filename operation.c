@@ -131,7 +131,10 @@ static char* change_checked(char* new_blk, char* old_blk, int blk_size,int* cg_n
 
 
 	if(change_nums ==0)
+	{
+		free(blk_cg);
 		return NULL;
+	}
 	else
 		return blk_cg;
 
@@ -178,6 +181,13 @@ static int uszram_compress_page(struct page * pg, char * pg_buffer){
 
 	memcpy(pg->compr_data, compr_pg, new_size);
 
+	//printf("The diff value is %d\n", new_size - pg->compr_size);
+	//printf("The new size is %d, pg->compr_size is %u\n", new_size, pg->compr_size);
+
+	pg->t_size += (new_size - pg->compr_size);
+	pg->compr_size = new_size;
+	
+
 	#if DEBUG_MODE
 		printf("DEBUG MODE: The new compress page size is %d\n", new_size);
 	#endif 
@@ -201,6 +211,8 @@ static void apply_cg_to_page(struct page * pg, char* data) {
 
 
 	while(cp) {
+		//printf("Applying change buffer to block %u  decompression!\n", cp->blk_id);
+		//printf("Applying change buffer to block %u  decompression!\n", cp->blk_id);
 		#if DEBUG_MODE
 		printf("Applying change buffer to block %u  decompression!\n", cp->blk_id);
 		#endif
@@ -261,17 +273,6 @@ static void apply_cg_to_tar_blk(struct page * pg, char* data, uint_least8_t blk_
 
 }
 
-/*
-static void free_cg_lists(struct page* pg){
-	while(pg->cg_buffer_head){
-		cg_buffer * temp = pg->cg_buffer_head->next;
-		free(pg->cg_buffer_head);
-		pg->cg_buffer_head = temp;
-	}
-
-	return;
-}
-*/
 
 static void update_hot_blk(struct page * pg, page_init* data){
 
@@ -396,14 +397,14 @@ static void update_hot_blk(struct page * pg, page_init* data){
 }
 
 
-// return 0 not exist, 1 exist not hot, 2 exist hot
-static int do_kv_update(op_item* op_data, page_init * pg_buffer){
+// return 0 not exist, 1 exist not hot, 2 exist hot, 3 in overflow buffer
+static int do_kv_update(op_item* op_data, page_init * pg_buffer, struct page * pg){
 
 	#if DEBUG_MODE
 		printf("DEBUG MODE: In do_kv_update, the start index for the target blk is %u and blk id is %d\n",HOT_BLOCK_SIZE+ BLOCK_SIZE* (op_data->blk_id-1),op_data->blk_id );
 	#endif
-
-	blk * tar_blk = &(pg_buffer->new_blks[op_data->blk_id-1]);
+	//printf("DEBUG MODE: In do_kv_update, the blk id is %u\n",op_data->blk_id );
+	blk * tar_blk = &(pg_buffer->new_blks[(op_data->blk_id)-1]);
 
     int tar_kv_nums = tar_blk-> kv_nums;
 
@@ -421,7 +422,7 @@ static int do_kv_update(op_item* op_data, page_init * pg_buffer){
 	{
 		if(tar_hot_blk->items[i].key == op_data->key) // Find the key in the hot_blk and update the value
 		{
-
+			//printf("DEBUG MODE: In do_kv_update, find the key in hot block\n");
 			#if DEBUG_MODE
 				printf("DEBUG MODE: In do_kv_update, find the key in hot block\n");
 			#endif
@@ -443,6 +444,9 @@ static int do_kv_update(op_item* op_data, page_init * pg_buffer){
 				exist = 2;
 			else 
 			{
+				//printf("DEBUG MODE: In do_kv_update, find the key in the block(not hot)\n");
+				//sleep(5);
+				//printf("THe key is %lu\n", op_data->key);
 				#if DEBUG_MODE
 				printf("DEBUG MODE: In do_kv_update, find the key in the block(not hot)\n");
 				#endif
@@ -450,6 +454,26 @@ static int do_kv_update(op_item* op_data, page_init * pg_buffer){
 			}
 				
 		}
+	}
+
+	if(exist == 0) // Try to search the overflow buffer
+	{
+		of_item* temp = pg->of_buffer_head;
+
+		while(temp!=NULL)
+		{
+			if(temp->key == op_data->key)
+			{
+				memcpy(temp->value, op_data->value, VALUE_SIZE);
+				#if DEBUG_MODE
+				printf("DEBUG MODE: In do_kv_update, find the key in the overflow lists\n");
+				#endif
+				exist = 3;
+			}
+			temp = temp->next;
+		}
+
+
 	}
 
 	return exist;
@@ -476,16 +500,17 @@ static int do_kv_insert(op_item* op_data, page_init * pg_buffer){
 
 	if(tar_kv_nums == ITEM_PER_BLK) // The Blk does not have enough space for the new kv_item
 	{
+
 		#if DEBUG_MODE
 			printf("DEBUG MODE: In do_kv_insert, key overflow ocurr\n");
-			sleep(1);
+			//sleep(1);
 		#endif
 
 
 		return 1;
 	}
 	else
-	{	
+	{	//printf("The tar_kv_num is %d\n", tar_kv_nums);
 		tar_blk->items[tar_kv_nums].key = op_data->key;
 		memcpy(tar_blk->items[tar_kv_nums].value, op_data->value, VALUE_SIZE);
 		tar_blk->kv_nums +=1;
@@ -523,17 +548,19 @@ static int do_kv_delete(op_item* op_data, page_init * pg_buffer){
   background worker function
 */
 
-static int uszram_flush_pg(uint_least32_t pg_addr){
-	uint_least32_t lk_addr = pg_addr /PG_PER_LOCK;
-    struct page * pg = pgtbl + pg_addr;
+static int uszram_flush_pg(uint_least64_t pg_addr){
+	uint_least64_t lk_addr = pg_addr /PG_PER_LOCK;
     struct lock * lk = lktbl + lk_addr;
+
+    lock_as_writer(lk);
+
+    struct page * pg = pgtbl + pg_addr;
+
 
     page_init pg_buffer;
     page_init org_pg_buffer;
 
     int ret;
-
-    lock_as_writer(lk);
 
 
     if(pg->compr_data == NULL) // THe first time write the page
@@ -569,8 +596,25 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 					if(ret == 0)
 					{
 						remain_op_counts -=1;
-					}
+						temp->items[i].op =2;
 
+					}else                                                 //Overflow ocurr
+					{
+						of_item* temp_of = malloc(sizeof(of_item));
+						temp_of->key = temp->items[i].key;
+						memcpy(temp_of->value, temp->items[i].value, VALUE_SIZE);
+						temp_of->blk_id = temp->items[i].blk_id;
+						temp_of->next = pg->of_buffer_head;
+						pg->of_buffer_head = temp_of;
+						pg->of_counts +=1;
+
+						pg->t_size +=sizeof(of_item);
+
+						#if DEBUG_MODE
+						printf("DEBUG MODE: Add the kv_item with key %lu into the overflow lists\n", temp->items[i].key);
+						#endif
+
+					}
 
 				}else if(temp->items[i].op ==1){
 					do_kv_delete(&(temp->items[i]), &pg_buffer);
@@ -586,139 +630,27 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 
 	    //update_hot_blk(pg,&pg_buffer);
 	    uszram_compress_page(pg, (char *)&pg_buffer);
-
-	    int new_op_counts =0;
-	    //create the new op_buffer lists
-		//The item remain in the old lists will be moved to the new lists (OVERFLOW USAGE)
-		if(remain_op_counts >0)
-		{	
-			op_buffer * temp = pg->op_buffer_head;
-
-
-			#if DEBUG_MODE
-				printf("DEBUG MODE: After recompress, the overflow op items are %d!\n", remain_op_counts);
-			#endif 
-
-			op_buffer * new_op_head = malloc(sizeof(op_buffer));
-
-			new_op_head->item_nums = 0;
-			new_op_head->next = NULL;
-
-			int new_op_counts =0;
-
-			while(temp !=NULL)
-			{
-				for(int i=0;i<ITEM_PER_OP; i++)
-				{
-					if(temp->items[i].op == 3) //Overflow item
-					{
-
-						op_buffer * new_temp = new_op_head;
-
-						while(new_temp->next !=NULL) // Go to the last op buffer
-						{
-						 	new_temp = new_temp->next;
-						}
-
-						if(new_temp->item_nums<ITEM_PER_OP) //Current op_buffer have empty slot
-						{
-							new_temp->items[new_temp->item_nums].op =0;
-							new_temp->items[new_temp->item_nums].blk_id = temp->items[i].blk_id;
-							new_temp->items[new_temp->item_nums].key = temp->items[i].key;
-							memcpy(new_temp->items[new_temp->item_nums].value,temp->items[i].value, VALUE_SIZE);
-							new_temp->item_nums +=1;
-
-						}else                               // New op_buffer is needed
-						{
-							op_buffer * new_temp1 = malloc(sizeof(op_buffer));
-							new_temp1->item_nums = 0;
-
-							new_temp1->items[0].op =0;
-							new_temp1->items[0].blk_id = temp->items[i].blk_id;
-							new_temp1->items[0].key = temp->items[i].key;
-							memcpy(new_temp1->items[0].value,temp->items[i].value, VALUE_SIZE);
-							new_temp1->item_nums +=1;
-							new_temp1->next = NULL;
-							
-							new_temp->next = new_temp1;
-
-
-						}
-
-						new_op_counts +=1;
-
-					}
-				}
-
-				temp = temp->next;
-			}
-
-			pg->op_counts = new_op_counts;
-
-
-
-			#if DEBUG_MODE
-				printf("DEBUG MODE: The new created op items are %d!\n", new_op_counts);
-			#endif 
-
-			//free old op buffer
-
-			op_buffer * temp1 = pg->op_buffer_head;
-
-			while(temp1!=NULL)
-			{
-				op_buffer * temp2 = temp1;
-				temp1 = temp1->next;	
-				free(temp2);
-			}
-
-
-			pg->op_buffer_head = new_op_head;
-
-
-			unlock_as_writer(lk);
-
-			return 0;
-
-
-		}
-
-
-
-		pg->op_counts = 0;
-
-		#if DEBUG_MODE
-			printf("DEBUG MODE: The new created op items is %d! (should be 0)\n", new_op_counts);
-		#endif 
-
+   
 		//free old op buffer
-
 		op_buffer * temp1 = pg->op_buffer_head;
-
 		while(temp1!=NULL)
 		{
 			op_buffer * temp2 = temp1;
 			temp1 = temp1->next;	
 			free(temp2);
+			//printf("Come HERE\n");
+			pg->t_size -=sizeof(op_buffer);
 		}
 
 
 		pg->op_buffer_head = NULL;
-
-		if(pg->op_buffer_head ==NULL)
-		{
-			#if DEBUG_MODE
-			printf("DEBUG MODE: old buffer is clean !\n");
-			#endif 
-		}
-
-
-
+		pg->op_counts = 0;
 		unlock_as_writer(lk);
 
 		return 0;
 
-    }
+
+	}
 
 
     ret = uszram_decompress_page_no_cg(pg, (char *)&pg_buffer);                      //Decompress the entire page without apply cg_buffer link data 
@@ -738,8 +670,9 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
     int new_put_ops =0, tol_succ_ops = 0;
     int update_ops = 0;
 	int remain_op_counts = pg->op_counts;
+	int delete_ops = 0;
 
-	int cg_blks = 0;
+	uint_least64_t cg_blks = 0;
 	int hot_blk_cg = 0;
 
 
@@ -756,7 +689,9 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 				#if DEBUG_MODE
 				printf("DEBUG MODE: Try to update item with key %lu in the blk\n",temp->items[i].key);
 				#endif
-				int ret = do_kv_update(&(temp->items[i]), &pg_buffer); //only write the new data to the hot_blk && block when the key is already exist
+
+				//printf("THe item blk_id is %u\n", temp->items[i].blk_id);
+				int ret = do_kv_update(&(temp->items[i]), &pg_buffer, pg); //only write the new data to the hot_blk && block when the key is already exist
 
 				if(ret ==0) // new kv op_item op is keep in op_buffer wait to be recompress
 				{
@@ -765,6 +700,7 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 
 				}else if(ret ==1) // old kv, set op_item op to be 2 which means it needs to be delete
 				{
+					//printf("Come here 1\n");
 					update_ops +=1;
 					temp->items[i].op = 2;
 					tol_succ_ops +=1;
@@ -772,9 +708,16 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 
 				}else if(ret ==2) // old kv && in hot buffer, set op_item op to be 2 which means it needs to be delete
 				{   
+					//printf("Come here 2\n");
 					update_ops +=1;
 					temp->items[i].op = 2;     
 					hot_blk_cg = 1;
+					tol_succ_ops +=1;
+					remain_op_counts -=1;
+				}else if(ret == 3) // old kv in the overflow buffer linked list
+				{
+					update_ops +=1;
+					temp->items[i].op = 4;
 					tol_succ_ops +=1;
 					remain_op_counts -=1;
 				}
@@ -782,13 +725,16 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 			}else{
 				do_kv_delete(&(temp->items[i]), &pg_buffer);
 				tol_succ_ops +=1;
+				delete_ops =1;
 
 			}
 		
 			if(temp->items[i].op !=2){ // new kv or delete kv cg_buffer do not record the update
 				continue;
 			}else{      // old kv update cg_buffer need to record it
-				
+				//printf("Come Here\n");
+				//printf("THe op is %u\n", temp->items[i].op);
+				//sleep(1);
 				cg_blks |= 1<<temp->items[i].blk_id;  // Record the blk_ids needed to be update (in bit level) for example blk 1 => cg_blks |= 1<<1;
 
 			}
@@ -808,6 +754,7 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 
 		if(i == 0 &&  hot_blk_cg ==1) // Create the cg buffer for hot blk
 		{
+			//printf("Come herer1\n");
 
 			#if DEBUG_MODE
 				printf("DEBUG MODE: Create cg for hot block\n");
@@ -831,6 +778,8 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 
 			cg_buffer * cg_temp = malloc(sizeof(cg_buffer)+ BYTE_PER_CG*cg_seg_num); //sizeof.. 
 
+			pg->t_size +=(sizeof(cg_buffer)+ BYTE_PER_CG*cg_seg_num);
+
 			memcpy(cg_temp->status, blk_cg_stats, SEG_PER_BLK*2);
 			cg_temp->blk_id = 0;
 			cg_temp->next = NULL;
@@ -848,6 +797,8 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 
 		}else if(cg_blks & (1<<i) ) // Create the cg buffer for normal blk ?
 		{
+			//printf("Come Here2\n");
+
 			int cg_seg_num;
 			//char new_blk[BLOCK_SIZE], old_blk[BLOCK_SIZE];
 			
@@ -859,6 +810,8 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 			char* blk_cg = change_checked((char *)new_blk, (char *)old_blk, BLOCK_SIZE, &cg_seg_num, blk_cg_stats); //Create the char buffer to record change
 
 			cg_buffer * cg_temp = malloc(sizeof(cg_buffer)+ BYTE_PER_CG*cg_seg_num);
+
+			pg->t_size +=(sizeof(cg_buffer)+ BYTE_PER_CG*cg_seg_num);
 
 			memcpy(cg_temp->status, blk_cg_stats, SEG_PER_BLK*2);
 
@@ -887,6 +840,7 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 			}
 
 			new_cg_counts +=cg_seg_num;
+			//printf("DEBUG MODE: cg_seg_num is %d for block %d\n", cg_seg_num, i);
 
 			#if DEBUG_MODE
 				printf("DEBUG MODE: cg_seg_num is %d for block %d\n", cg_seg_num, i);
@@ -907,12 +861,13 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 		cg_buffer* temp = pg->cg_buffer_head->next;
 		free(pg->cg_buffer_head);
 		pg->cg_buffer_head = temp;
+		pg->t_size -=(sizeof(cg_buffer));
+
 	}  
 
-
+	pg->t_size -=BYTE_PER_CG*pg->cg_counts;
 	pg->cg_buffer_head = new_cg_buffer_head;
     pg->cg_counts = new_cg_counts;
-
 
 	#if DEBUG_MODE
     printf("DEBUG MODE: new cg_counts is %d\n", pg->cg_counts);
@@ -924,14 +879,77 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 
 	Case 2: update_op < tol_op /2
 	*/
+	//int of_changed = 0;
 
 	if((pg->cg_counts > CG_NUM_MAX) || update_ops <= tol_succ_ops/2)
 	{
+
 		#if DEBUG_MODE
 				printf("DEBUG MODE: Recompression is needed for this page\n");
 		#endif
 
 		//APPLY the OP_buffer LIST to pg_buffer(where the pg_buffer data is )
+
+		if(delete_ops == 1) //op_buffer contains several delete operation, which means there may be empty slot for the overflow buffer
+		{
+
+
+			of_item * temp1 = pg->of_buffer_head;
+			of_item * new_of_head = NULL;
+
+
+			while(temp1!=NULL)                                     //flush of_buffer links data to pg_buffer
+			{
+				
+				op_item temp_kv;
+
+				temp_kv.key = temp1->key;
+				memcpy(temp_kv.value, temp1->value, VALUE_SIZE);
+				temp_kv.blk_id = temp1->blk_id;
+
+
+				int ret = do_kv_insert(&temp_kv, &pg_buffer); // ret = 0 succ, ret = 1 failed
+				if(ret == 1)
+				{
+					of_item* temp_of = malloc(sizeof(of_item));
+					temp_of->key = temp1->key;
+					memcpy(temp_of->value, temp1->value, VALUE_SIZE);
+					temp_of->blk_id = temp1->blk_id;
+					pg->t_size +=sizeof(of_item);
+					temp_of->next = new_of_head;
+					new_of_head = temp_of;
+					pg->of_counts +=1;
+					#if DEBUG_MODE
+					printf("DEBUG MODE: Add the kv_item with key %lu into the overflow lists\n", temp1->key);
+					#endif
+
+
+				}
+
+				temp1 = temp1->next;   
+			}
+
+
+			if(new_of_head!=NULL) // New of_linked_list is created
+			{
+				temp1 = pg->of_buffer_head;
+
+				while(temp1!=NULL)
+				{
+					of_item * temp2 = temp1;
+					temp1 = temp1->next;	
+					free(temp2);
+					//printf("Come here \n");
+					pg->t_size -=sizeof(of_item);
+					pg->of_counts -=1;
+				}
+
+				pg->of_buffer_head = new_of_head;
+
+			}
+
+		}
+
 		
 		op_buffer* temp = pg->op_buffer_head;
 		while(temp!=NULL)                                     //flush op_buffer links data to pg_buffer
@@ -943,9 +961,24 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 					int ret = do_kv_insert(&(temp->items[i]), &pg_buffer); // ret = 0 succ, ret = 1 failed
 					if(ret == 0)
 					{
+						temp->items[i].op = 2;
 						remain_op_counts -=1;
-					}
+					}else                                                  // Add the kv_pair to overflow buffer
+					{
+						of_item* temp_of = malloc(sizeof(of_item));
+						temp_of->key = temp->items[i].key;
+						memcpy(temp_of->value, temp->items[i].value, VALUE_SIZE);
+						temp_of->blk_id = temp->items[i].blk_id;
+						temp_of->next = pg->of_buffer_head;
+						pg->of_buffer_head = temp_of;
+						pg->of_counts +=1;
+						pg->t_size +=sizeof(of_item);
 
+						#if DEBUG_MODE
+						printf("DEBUG MODE: Add the kv_item with key %lu into the overflow lists\n", temp->items[i].key);
+						#endif
+
+					}
 
 				}else if(temp->items[i].op ==1){
 					do_kv_delete(&(temp->items[i]), &pg_buffer);
@@ -956,132 +989,36 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 			temp = temp->next;   
 		}
 
+
 	    //Recompress the page
 	    //First move the new hot items to the hot block
 
 	    update_hot_blk(pg,&pg_buffer);
 	    uszram_compress_page(pg, (char *)&pg_buffer);
 
+
+	    //free cg_buffer linked list
+	    //free_cg_lists(pg);
+		while(pg->cg_buffer_head !=NULL)
+		{
+			cg_buffer* temp = pg->cg_buffer_head->next;
+			free(pg->cg_buffer_head);
+			pg->cg_buffer_head = temp;
+			pg->t_size -=(sizeof(cg_buffer));
+
+		}  
+
+		pg->t_size -=BYTE_PER_CG*pg->cg_counts;
+
+
+		pg->cg_counts = 0;
+		pg->cg_buffer_head = NULL;
+
+
 	} 
 	
-	//create the new op_buffer lists
-	//The item remain in the old lists will be moved to the new lists (OVERFLOW USAGE)11
-	int new_op_counts =0;
-
-	if(remain_op_counts >0)
-	{	
-		op_buffer * temp = pg->op_buffer_head;
-
-
-		#if DEBUG_MODE
-			printf("DEBUG MODE: The new op items are %d!\n", remain_op_counts);
-		#endif 
-
-		op_buffer * new_op_head = malloc(sizeof(op_buffer));
-
-		new_op_head->item_nums = 0;
-		new_op_head->next = NULL;
-
-
-		while(temp !=NULL)
-		{
-			for(int i=0;i<ITEM_PER_OP; i++)
-			{
-				if(temp->items[i].op == 3) //Overflow item
-				{
-
-					op_buffer * new_temp = new_op_head;
-
-					while(new_temp->next !=NULL) // Go to the last op buffer
-					{
-
-						new_temp = new_temp->next;
-
-					}
-
-					if(new_temp->item_nums<ITEM_PER_OP) //Current op_buffer have empty slot
-					{
-
-						#if DEBUG_MODE
-						printf("DEBUG MODE: Put the item in slot %d in the last op buffer\n", new_temp->item_nums);
-						#endif
-
-						new_temp->items[new_temp->item_nums].op =3;
-						new_temp->items[new_temp->item_nums].blk_id = temp->items[i].blk_id;
-						new_temp->items[new_temp->item_nums].key = temp->items[i].key;
-						memcpy(new_temp->items[new_temp->item_nums].value,temp->items[i].value, VALUE_SIZE);
-						new_temp->item_nums +=1;
-
-					}else                               // New op_buffer is needed
-					{
-
-						#if DEBUG_MODE
-						printf("DEBUG MODE: Put the item in the first slot in a new create op buffer\n");
-						#endif
-
-
-						op_buffer * new_temp1 = malloc(sizeof(op_buffer));
-						new_temp1->item_nums = 0;
-
-						new_temp1->items[0].op =3;
-						new_temp1->items[0].blk_id = temp->items[i].blk_id;
-						new_temp1->items[0].key = temp->items[i].key;
-						memcpy(new_temp1->items[0].value,temp->items[i].value, VALUE_SIZE);
-						new_temp1->item_nums +=1;
-						new_temp1->next = NULL;
-						
-						new_temp->next = new_temp1;
-
-
-					}
-
-					new_op_counts +=1;
-
-				}
-			}
-
-			temp = temp->next;
-		}
-
-		pg->op_counts = new_op_counts;
-
-		#if DEBUG_MODE
-			printf("DEBUG MODE: The new created op items are %d!\n", new_op_counts);
-		#endif 
-
-
-		//free old op buffer
-
-		op_buffer * temp1 = pg->op_buffer_head;
-
-		while(temp1!=NULL)
-		{
-			op_buffer * temp2 = temp1;
-			temp1 = temp1->next;	
-			free(temp2);
-		}
-
-
-
-		pg->op_buffer_head = new_op_head;
-
-		unlock_as_writer(lk);
-
-		return 0;
-
-
-	}
-
-	pg->op_counts = new_op_counts;
-
-
-	#if DEBUG_MODE
-		printf("DEBUG MODE: The new created op items is %d!(should be 0)\n", new_op_counts);
-	#endif 
 
 	//free old op buffer
-
-	
 
 	op_buffer * temp1 = pg->op_buffer_head;
 
@@ -1090,10 +1027,12 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 		op_buffer * temp2 = temp1;
 		temp1 = temp1->next;	
 		free(temp2);
+		pg->t_size -=sizeof(op_buffer);
 	}
 
 
 	pg->op_buffer_head =NULL;
+	pg->op_counts = 0;
 
 	if(pg->op_buffer_head ==NULL)
 	{
@@ -1102,6 +1041,18 @@ static int uszram_flush_pg(uint_least32_t pg_addr){
 		#endif 
 	}
 
+	#if DEBUG_MODE
+	printf("DEBUG MODE: The overflow counts is %u\n", pg->of_counts);
+
+	of_item* of_temp = pg->of_buffer_head;
+
+	while(of_temp !=NULL)
+	{
+		printf("The of_item key is %lu\n",of_temp->key);
+		of_temp = of_temp->next;
+	}
+
+	#endif 
 
 	unlock_as_writer(lk);
 
@@ -1153,17 +1104,16 @@ static void * worker_init(void * argu)
 		worker->recompr_pages = 0;
        
        //Loop through the corresponding table range assigned
-		for(uint64_t i=worker->range_start;i<worker->range_start+worker->range_count;i++)
+		for(uint_least64_t i=worker->range_start;i<worker->range_start+worker->range_count;i++)
 		{
 			
 
-			uint64_t lk_addr = i/PG_PER_LOCK;
+			uint_least64_t lk_addr = i/PG_PER_LOCK;
+			struct lock * lk = lktbl +lk_addr;
+			lock_as_reader(lk);
+
 
 			struct page * pg = pgtbl + i;
-			struct lock * lk = lktbl +lk_addr;
-
-
-			lock_as_reader(lk);
 
 			if(pg->op_counts >=worker->op_buffer_trigger ) //Page flush is needed
 			{
@@ -1171,9 +1121,12 @@ static void * worker_init(void * argu)
 				#if DEBUG_MODE
 				printf("Worker Flush trigger, the pg->op_counts is %d and the op_buffer_trigger is %d\n", pg->op_counts, worker->op_buffer_trigger );
 				#endif
-			
-
+				//printf("i is %ld, lk_addr is %lu\n",i, lk_addr);
+				//printf("Worker Flush trigger, the pg->op_counts is %d and the op_buffer_trigger is %d\n", pg->op_counts, worker->op_buffer_trigger );
+				//sleep(1);
 				uszram_flush_pg(i);
+				worker->recompr_pages += 1;
+
 
 			}else
 			{
@@ -1212,11 +1165,16 @@ int uszram_init(void)
 		(pgtbl+i)->compr_data = NULL;
 	    (pgtbl+i)->op_buffer_head = NULL;
 		(pgtbl+i)->cg_buffer_head = NULL;
+		(pgtbl+i)->of_buffer_head = NULL;
 
 
 		(pgtbl+i)->op_counts = 0;
+		(pgtbl+i)->cg_counts = 0;
+		(pgtbl+i)->of_counts = 0;
+
+
 		(pgtbl+i)->compr_size = 0;
-		//(pgtbl+i)->t_size = sizeof(struct page);
+		(pgtbl+i)->t_size = sizeof(struct page);
     	//(pgtbl+i)->hot_items = {0};
     	(pgtbl+i)->hot_front = 0;
 		(pgtbl+i)->hot_tail = 0;
@@ -1246,6 +1204,11 @@ int uszram_init(void)
     stats.put_miss = 0;
     stats.delete_hit = 0;
     stats.delete_miss = 0;
+
+
+	//stats.tol_compr_size = 0;
+	//stats.tol_op_size = 0;
+	//stats.tol_cg_size = 0;
 
 	initialized = 1;
 
@@ -1290,21 +1253,30 @@ int uszram_kv_put(kv_item item){
 	uint_least64_t pg_addr = blk_addr/BLK_PER_PG;         //Determine the pg_address;
 	uint_least64_t lk_addr = pg_addr /PG_PER_LOCK;
 	
-	int blk_index = (blk_addr-pg_addr*BLK_PER_PG)+1;          //The tar_blk for this item
+	uint_least64_t blk_index = (blk_addr-pg_addr*BLK_PER_PG)+1;          //The tar_blk for this item
 
+	struct lock * lk = lktbl + lk_addr;
+	lock_as_writer(lk);
 
     struct page * pg = pgtbl + pg_addr;
-    struct lock * lk = lktbl + lk_addr;
+    //struct lock * lk = lktbl + lk_addr;
 
     #if DEBUG_MODE
     printf("THe LOCK address is %lu and page address is %lu\n", lk_addr, pg_addr);
 
-   	printf("THe blk index is %u  and key is %lu\n", blk_index,item.key);
+   	printf("THe blk index is %lu  and key is %lu\n", blk_index,item.key);
 
    	printf("THe blk addr is %lu\n", blk_addr);
    	#endif
    
-    lock_as_writer(lk);
+   	/*
+   	if(blk_index > BLK_PER_PG)
+   	{
+   		printf("HERE\n");
+   		printf("THE value is %ld\n", blk_index);
+   		sleep(5);
+   	}
+	*/
 
 	op_buffer* temp = pg->op_buffer_head;
 
@@ -1326,6 +1298,8 @@ int uszram_kv_put(kv_item item){
 
 		pg->op_buffer_head = new_op;
 		pg->op_counts +=1;
+
+		pg->t_size +=sizeof(op_buffer);
 	}
 	else
 	{
@@ -1391,6 +1365,9 @@ int uszram_kv_put(kv_item item){
 				temp->next = new_op;
 				pg->op_counts +=1;
 				exist = 1;
+
+				pg->t_size +=sizeof(op_buffer);
+
 
 			}
 			temp = temp->next;
@@ -1458,11 +1435,20 @@ kv_item * uszram_kv_get(uint_least64_t key){
 	uint_least8_t blk_index = blk_addr-pg_addr*BLK_PER_PG+1;
 
 
+	//Force to be in the first page;
+	blk_addr = blk_addr%14;
+
+
     struct page * pg = pgtbl + pg_addr;
     struct lock * lk = lktbl + lk_addr;
 
    
     lock_as_reader(lk);
+
+    #if DEBUG_MODE
+		printf("DEBUG MODE: Try to get the kv_item with key %lu\n", key);
+	#endif 
+
 
 
 
@@ -1706,6 +1692,43 @@ kv_item * uszram_kv_get(uint_least64_t key){
 		}
 	}
 
+	//Find in the overflow buffer
+	of_item* temp_of = pg->of_buffer_head; 
+
+	while(temp_of!=NULL)
+	{
+		if(temp_of->key == key)
+		{
+			#if DEBUG_MODE
+				printf("DEBUG MODE: Find the key in overflow lists\n");
+			#endif
+
+			kv_item * tar_item = malloc(sizeof(kv_item));
+
+			tar_item->key = key;
+			memcpy(tar_item->value, temp_of->value, VALUE_SIZE);
+
+
+			unlock_as_reader(lk);
+
+			lock_as_writer(&stat_lock);
+
+			stats.get_hit +=1;
+
+
+			unlock_as_writer(&stat_lock);
+
+
+
+			return tar_item;
+		}
+
+		temp_of = temp_of->next;
+
+	}
+
+
+
 
 #if DEBUG_MODE
 	printf("DEBUG MODE: Not Find the item in the at all!\n");
@@ -1743,6 +1766,28 @@ void print_status(void)
 	printf("put_miss is   %lu\n", stats.put_miss);
 	printf("//////////////////////////////////////\n");
 
+	uint64_t tol_page_size=0;
+
+	for(int i = 0; i< PAGE_COUNT;i++)
+	{
+		if(i < 100)
+		{
+			printf("The page %d tol_size is %u pg mata is %lu\n",i, pgtbl[i].t_size,sizeof(struct page));
+			printf("THE page op_counts is %u, cg_counts is %u\n",pgtbl[i].op_counts, pgtbl[i].cg_counts);
+			printf("The page compr_size is %u\n", pgtbl[i].compr_size);
+			printf("THe page of_counts is %u\n", pgtbl[i].of_counts);
+		}
+	
+		tol_page_size += pgtbl[i].t_size;
+
+	}
+	printf("Total page size is %lu\n", tol_page_size);
+
+	printf("The size of op_buffer is %lu\n", sizeof(op_buffer));
+	printf("The size of cg_buffer is %lu\n", sizeof(cg_buffer));
+
+
+	//printf("Size of page table is %ld\n", sizeof(pgtbl));
 
 
 	unlock_as_reader(&stat_lock);
