@@ -1,5 +1,5 @@
 char* change_checked(char* new_blk, char* old_blk, int blk_size,int* cg_nums, char* cg_stats_out) {
-
+  
 	short total_nums = blk_size/BYTE_PER_CG;
 
 	short change_nums = 0;
